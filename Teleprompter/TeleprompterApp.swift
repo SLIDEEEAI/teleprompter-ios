@@ -12,7 +12,7 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
     @Published var configured = false
     @Published var playing = false
     @Published var error: String?
-    @Published var status = "Режим прямых кадров · версия 0.2"
+    @Published var status = "Режим прямых кадров · версия 0.4"
     let displayLayer = AVSampleBufferDisplayLayer()
     private var pip: AVPictureInPictureController?
     private var observation: NSKeyValueObservation?
@@ -38,6 +38,15 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
     private var elapsed = 0.0
     private var lastTick = CACurrentMediaTime()
     private var frameNumber: Int64 = 0
+    private var frameErrorReported = false
+    private var firstFrameReported = false
+
+    private func frameError(_ message: String) {
+        guard !frameErrorReported else { return }
+        frameErrorReported = true
+        error = message
+        record(message)
+    }
 
     override init() {
         super.init()
@@ -85,14 +94,20 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
     }
 
     func configure(text: String, speed: Double, fontSize: Double) {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        record("Apply pressed: \(text.count) characters")
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { error = "Вставьте текст."; return }
         guard text.count <= 20000 else { error = "Максимум 20 000 символов."; return }
         prompt = text; self.speed = speed; self.fontSize = fontSize
         error = nil; configured = true
+        frameErrorReported = false; firstFrameReported = false
+        displayLayer.flushAndRemoveImage()
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        } catch { self.error = error.localizedDescription; record("Audio category: \(error.localizedDescription)") }
         textHeight = Double((text as NSString).boundingRect(with: CGSize(width: 592, height: CGFloat.greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes, context: nil).height)
         reset()
-        status = "Прямые кадры готовы · версия 0.2"
+        status = "Прямые кадры готовы · версия 0.4"
         startTimer()
     }
 
@@ -166,14 +181,15 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
                     kCVPixelBufferCGImageCompatibilityKey as String: true,
                     kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
                 ]
-                CVPixelBufferPoolCreate(nil, nil, settings as CFDictionary, &pool)
+                let result = CVPixelBufferPoolCreate(nil, nil, settings as CFDictionary, &pool)
+                if result != kCVReturnSuccess { frameError("Не удалось создать буфер кадров: \(result)") }
             }
             var optionalBuffer: CVPixelBuffer?
-            guard let pool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer) == kCVReturnSuccess, let buffer = optionalBuffer else { return }
+            guard let pool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer) == kCVReturnSuccess, let buffer = optionalBuffer else { frameError("Не удалось выделить кадр."); return }
             CVPixelBufferLockBaseAddress(buffer, [])
             guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 640, height: 360, bitsPerComponent: 8,
                 bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) else {
-                CVPixelBufferUnlockBaseAddress(buffer, []); return
+                CVPixelBufferUnlockBaseAddress(buffer, []); frameError("Не удалось создать графический контекст."); return
             }
             context.setFillColor(UIColor.black.cgColor)
             context.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
@@ -184,21 +200,34 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
             UIGraphicsPopContext()
             CVPixelBufferUnlockBaseAddress(buffer, [])
             if format == nil { CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &format) }
-            guard let format else { return }
+            guard let format else { frameError("Не удалось создать формат кадра."); return }
             var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 20),
-                presentationTimeStamp: CMTime(value: frameNumber, timescale: 20), decodeTimeStamp: .invalid)
+                presentationTimeStamp: displayLayer.controlTimebase.map { CMTimebaseGetTime($0) } ?? CMClockGetTime(CMClockGetHostTimeClock()), decodeTimeStamp: .invalid)
             frameNumber += 1
             var sample: CMSampleBuffer?
             let result = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer,
                 formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
-            guard result == noErr, let sample else { return }
+            guard result == noErr, let sample else { frameError("Не удалось создать видеокадр: \(result)"); return }
             // Immediate presentation avoids relying on a media player's playback clock.
-            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [NSMutableDictionary],
-               let attachment = attachments.first {
-                attachment[kCMSampleAttachmentKey_DisplayImmediately] = true
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+               CFArrayGetCount(attachments) > 0 {
+                let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+                CFDictionarySetValue(dictionary,
+                    Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
             }
-            if displayLayer.status == .failed { displayLayer.flush() }
-            if displayLayer.isReadyForMoreMediaData { displayLayer.enqueue(sample) }
+            if displayLayer.status == .failed {
+                let message = displayLayer.error?.localizedDescription ?? "Ошибка слоя отображения"
+                frameError(message)
+                displayLayer.flush()
+            }
+            if displayLayer.isReadyForMoreMediaData {
+                displayLayer.enqueue(sample)
+                if !firstFrameReported {
+                    firstFrameReported = true
+                    record("First frame enqueued, layer status=\(displayLayer.status.rawValue)")
+                }
+            }
         }
     }
 
@@ -236,6 +265,8 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    Text("Версия 0.4 · диагностика кадров").font(.caption).foregroundStyle(.secondary)
+                    if let error = model.error { Text(error).foregroundStyle(.red) }
                     TextEditor(text: $text).focused($editingText)
                         .frame(height: 220).padding(8)
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary))
@@ -260,11 +291,12 @@ struct ContentView: View {
                             Button("С начала") { editingText = false; model.reset() }
                         }.buttonStyle(.bordered)
                         Button("Открыть плавающее окно") { editingText = false; model.openPiP() }
-                            .buttonStyle(.borderedProminent).disabled(!model.ready)
+                            .buttonStyle(.borderedProminent)
+                        Text(model.ready ? "PiP готово" : "PiP пока недоступно").font(.caption)
                     }
                     Toggle("Активировать аудиосессию (режим сравнения)", isOn: $model.activateAudioSession)
                         .font(.footnote)
-                    Text("Диагностическая версия 0.3. Сначала проверьте с выключенным переключателем. Для смены режима закройте PiP.")
+                    Text("Диагностическая версия 0.4. Сначала проверьте с выключенным переключателем. Для смены режима закройте PiP.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text(model.status).font(.footnote).foregroundStyle(.secondary)
                     DisclosureGroup("Журнал диагностики") {
