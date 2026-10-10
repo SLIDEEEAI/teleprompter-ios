@@ -165,7 +165,10 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
                 formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
             guard result == noErr, let sample else { return }
             // Immediate presentation avoids relying on a media player's playback clock.
-            CMSetAttachment(sample, key: kCMSampleAttachmentKey_DisplayImmediately, value: kCFBooleanTrue, attachmentMode: .shouldPropagate)
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [NSMutableDictionary],
+               let attachment = attachments.first {
+                attachment[kCMSampleAttachmentKey_DisplayImmediately] = true
+            }
             if displayLayer.status == .failed { displayLayer.flush() }
             if displayLayer.isReadyForMoreMediaData { displayLayer.enqueue(sample) }
         }
