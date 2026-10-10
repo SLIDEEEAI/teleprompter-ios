@@ -18,6 +18,18 @@ jobs:
       - name: Build for physical iPhone
         run: |
           xcodebuild -project Teleprompter.xcodeproj -scheme Teleprompter -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Build simulator app
+        run: xcodebuild -project Teleprompter.xcodeproj -scheme Teleprompter -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath simulator-build CODE_SIGNING_ALLOWED=NO build
+      - name: Check preview on simulator
+        run: |
+          python3 scripts/check_preview.py
+      - name: Upload preview evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-evidence
+          path: preview.png
+          retention-days: 7
       - name: Package unsigned app for local signing
         run: |
           mkdir -p package/Payload

@@ -3,7 +3,12 @@ import AVKit
 
 @main
 struct TeleprompterApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
+    var body: some Scene {
+        WindowGroup {
+            if CommandLine.arguments.contains("--preview-smoke") { PreviewSmokeView() }
+            else { ContentView() }
+        }
+    }
 }
 
 @MainActor
@@ -341,4 +346,17 @@ struct PromptSurface: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: PromptView, context: Context) {}
+}
+
+
+struct PreviewSmokeView: View {
+    @StateObject private var model = PromptModel()
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            PromptSurface(model: model).frame(width: 320, height: 180)
+        }.onAppear {
+            model.configure(text: "Проверка текста\nPREVIEW TEST 503", speed: 35, fontSize: 46)
+        }
+    }
 }
