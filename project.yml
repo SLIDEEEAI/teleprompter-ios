@@ -21,8 +21,8 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Телесуфлер
         INFOPLIST_KEY_LSRequiresIPhoneOS: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.5.0"
+        CURRENT_PROJECT_VERSION: "5"
     info:
       path: Generated/Info.plist
       properties:

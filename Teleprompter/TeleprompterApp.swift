@@ -17,7 +17,7 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
     @Published var configured = false
     @Published var playing = false
     @Published var error: String?
-    @Published var status = "Режим прямых кадров · версия 0.4"
+    @Published var status = "Режим прямых кадров · версия 0.5"
     let displayLayer = AVSampleBufferDisplayLayer()
     private var pip: AVPictureInPictureController?
     private var observation: NSKeyValueObservation?
@@ -112,7 +112,7 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
         textHeight = Double((text as NSString).boundingRect(with: CGSize(width: 592, height: CGFloat.greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes, context: nil).height)
         reset()
-        status = "Прямые кадры готовы · версия 0.4"
+        status = "Прямые кадры готовы · версия 0.5"
         startTimer()
     }
 
@@ -180,20 +180,25 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
         autoreleasepool {
             if pool == nil {
                 let settings: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                     kCVPixelBufferWidthKey as String: 640,
                     kCVPixelBufferHeightKey as String: 360,
                     kCVPixelBufferCGImageCompatibilityKey as String: true,
-                    kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
+                    kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                    kCVPixelBufferMetalCompatibilityKey as String: true
                 ]
                 let result = CVPixelBufferPoolCreate(nil, nil, settings as CFDictionary, &pool)
                 if result != kCVReturnSuccess { frameError("Не удалось создать буфер кадров: \(result)") }
             }
             var optionalBuffer: CVPixelBuffer?
             guard let pool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer) == kCVReturnSuccess, let buffer = optionalBuffer else { frameError("Не удалось выделить кадр."); return }
+            guard CVPixelBufferGetIOSurface(buffer) != nil else {
+                frameError("Кадр не поддерживает аппаратное отображение."); return
+            }
             CVPixelBufferLockBaseAddress(buffer, [])
             guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 640, height: 360, bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) else {
+                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue) else {
                 CVPixelBufferUnlockBaseAddress(buffer, []); frameError("Не удалось создать графический контекст."); return
             }
             context.setFillColor(UIColor.black.cgColor)
@@ -270,7 +275,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Text("Версия 0.4 · диагностика кадров").font(.caption).foregroundStyle(.secondary)
+                    Text("Версия 0.5 · диагностика кадров").font(.caption).foregroundStyle(.secondary)
                     if let error = model.error { Text(error).foregroundStyle(.red) }
                     TextEditor(text: $text).focused($editingText)
                         .frame(height: 220).padding(8)
@@ -301,7 +306,7 @@ struct ContentView: View {
                     }
                     Toggle("Активировать аудиосессию (режим сравнения)", isOn: $model.activateAudioSession)
                         .font(.footnote)
-                    Text("Диагностическая версия 0.4. Сначала проверьте с выключенным переключателем. Для смены режима закройте PiP.")
+                    Text("Диагностическая версия 0.5. Сначала проверьте с выключенным переключателем. Для смены режима закройте PiP.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text(model.status).font(.footnote).foregroundStyle(.secondary)
                     DisclosureGroup("Журнал диагностики") {
