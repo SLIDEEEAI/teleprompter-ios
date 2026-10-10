@@ -54,11 +54,13 @@ struct ContentView: View {
     @AppStorage("speed") private var speed = 35.0
     @AppStorage("fontSize") private var fontSize = 32.0
     @StateObject private var model = PromptModel()
+    @FocusState private var editingText: Bool
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     TextEditor(text: $text)
+                        .focused($editingText)
                         .frame(height: 220)
                         .padding(8)
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary))
@@ -70,6 +72,7 @@ struct ContentView: View {
                     Text("Скорость задаёт движение текста. Сначала подготовьте видео, затем проверьте чтение в предпросмотре.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("Подготовить текст") {
+                        editingText = false
                         model.prepare(text: text, speed: speed, fontSize: fontSize)
                     }
                     .buttonStyle(.borderedProminent)
@@ -95,7 +98,14 @@ struct ContentView: View {
                     Text("Текст сохраняется на этом устройстве. Прототип работает без отправки текста на сервер.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }.padding()
-            }.navigationTitle("Телесуфлер")
+            }.scrollDismissesKeyboard(.interactively)
+            .navigationTitle("Телесуфлер")
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Готово") { editingText = false }
+                }
+            }
         }
     }
 }
