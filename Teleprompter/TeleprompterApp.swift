@@ -16,6 +16,17 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
     let displayLayer = AVSampleBufferDisplayLayer()
     private var pip: AVPictureInPictureController?
     private var observation: NSKeyValueObservation?
+    private var stateObservations: [NSKeyValueObservation] = []
+    @Published var diagnosticLog = ""
+    @Published var activateAudioSession = false
+
+    private func record(_ message: String) {
+        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        var lines = diagnosticLog.components(separatedBy: "\n").filter { !$0.isEmpty }
+        lines.append("\(timestamp) · \(message)")
+        diagnosticLog = lines.suffix(80).joined(separator: "\n")
+    }
+
     private var timer: Timer?
     private var interruptionObserver: NSObjectProtocol?
     private var pool: CVPixelBufferPool?
@@ -49,6 +60,14 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
             observation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] _, value in
                 DispatchQueue.main.async { self?.ready = value.newValue ?? false }
             }
+                    stateObservations = [
+                controller.observe(\.isPictureInPictureSuspended, options: [.initial, .new]) { [weak self] _, value in
+                    DispatchQueue.main.async { self?.record("PiP suspended=\(value.newValue ?? false)") }
+                },
+                controller.observe(\.isPictureInPictureActive, options: [.initial, .new]) { [weak self] _, value in
+                    DispatchQueue.main.async { self?.record("PiP active=\(value.newValue ?? false)") }
+                }
+            ]
         } else { error = "Картинка в картинке недоступна." }
         interruptionObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
             let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
@@ -56,8 +75,10 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
                 // Record the event without reactivating audio or fighting the recording app.
                 if type == AVAudioSession.InterruptionType.began.rawValue {
                     self?.status = "Аудиосессия прервана другим приложением"
+                    self?.record("Audio interruption began")
                 } else {
                     self?.status = "Прерывание аудиосессии завершено"
+                    self?.record("Audio interruption ended")
                 }
             }
         }
@@ -99,7 +120,13 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
         do {
             // PiP requires a playback category; no audio player or microphone is used.
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try AVAudioSession.sharedInstance().setActive(true)
+            if activateAudioSession {
+                try AVAudioSession.sharedInstance().setActive(true)
+                record("Start PiP: playback session activated")
+            } else {
+                try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+                record("Start PiP: playback session NOT activated")
+            }
         } catch { self.error = error.localizedDescription; return }
         setPlaying(true)
         pip.startPictureInPicture()
@@ -118,6 +145,7 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
     private func tick() {
         let now = CACurrentMediaTime()
         let delta = now - lastTick
+        if delta > 1 { record("Rendering gap: \(Int(delta)) seconds") }
         lastTick = now
         if playing {
             // Avoid skipping paragraphs if the OS suspends rendering.
@@ -174,7 +202,7 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
         }
     }
 
-    func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) { setPlaying(playing) }
+    func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) { record("PiP requested playing=\(playing)"); setPlaying(playing) }
     func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
         CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
     }
@@ -185,9 +213,9 @@ final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBuf
         drawFrame(); completionHandler()
     }
     func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ controller: AVPictureInPictureController) -> Bool { true }
-    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) { status = "PiP запущено · прямые кадры" }
+    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) { status = "PiP запущено · прямые кадры"; record("PiP did start") }
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
-        setPlaying(false); status = "PiP остановлено системой или пользователем"
+        record("PiP did stop"); setPlaying(false); status = "PiP остановлено системой или пользователем"
     }
     func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) { self.error = error.localizedDescription }
     func pictureInPictureController(_ controller: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) { completionHandler(true) }
@@ -234,7 +262,15 @@ struct ContentView: View {
                         Button("Открыть плавающее окно") { editingText = false; model.openPiP() }
                             .buttonStyle(.borderedProminent).disabled(!model.ready)
                     }
+                    Toggle("Активировать аудиосессию (режим сравнения)", isOn: $model.activateAudioSession)
+                        .font(.footnote)
+                    Text("Диагностическая версия 0.3. Сначала проверьте с выключенным переключателем. Для смены режима закройте PiP.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     Text(model.status).font(.footnote).foregroundStyle(.secondary)
+                    DisclosureGroup("Журнал диагностики") {
+                        Text(model.diagnosticLog).font(.caption.monospaced()).textSelection(.enabled)
+                        Button("Скопировать журнал") { UIPasteboard.general.string = model.diagnosticLog }
+                    }
                     Text("Без подготовки видео. Проверяем работу прямых кадров во время записи. Если текст или настройки изменены, нажмите «Применить».")
                         .font(.footnote).foregroundStyle(.secondary)
                         .onTapGesture { editingText = false }
