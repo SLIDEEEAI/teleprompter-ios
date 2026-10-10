@@ -11,258 +11,131 @@ struct TeleprompterApp: App {
     }
 }
 
+// A hosted view uses the video-call PiP content source. No media playback,
+// microphone, camera capture, audio-session activation, or private API is used.
 @MainActor
-final class PromptModel: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate, AVPictureInPictureControllerDelegate {
+final class PromptModel: NSObject, ObservableObject, AVPictureInPictureControllerDelegate {
     @Published var ready = false
     @Published var configured = false
     @Published var playing = false
     @Published var error: String?
-    @Published var status = "Режим прямых кадров · версия 0.5"
-    let displayLayer = AVSampleBufferDisplayLayer()
-    private var pip: AVPictureInPictureController?
-    private var observation: NSKeyValueObservation?
-    private var stateObservations: [NSKeyValueObservation] = []
+    @Published var status = "Текстовое окно · версия 0.6"
     @Published var diagnosticLog = ""
-    @Published var activateAudioSession = false
-
-    private func record(_ message: String) {
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        var lines = diagnosticLog.components(separatedBy: "\n").filter { !$0.isEmpty }
-        lines.append("\(timestamp) · \(message)")
-        diagnosticLog = lines.suffix(80).joined(separator: "\n")
-    }
-
+    private weak var inlineView: PromptView?
+    private let overlayView = PromptView()
+    private var contentController: AVPictureInPictureVideoCallViewController?
+    private var pip: AVPictureInPictureController?
+    private var observations: [NSKeyValueObservation] = []
     private var timer: Timer?
-    private var interruptionObserver: NSObjectProtocol?
-    private var pool: CVPixelBufferPool?
-    private var format: CMVideoFormatDescription?
     private var prompt = ""
     private var fontSize = 32.0
     private var speed = 35.0
     private var textHeight = 0.0
     private var elapsed = 0.0
-    private var lastTick = CACurrentMediaTime()
-    private var frameNumber: Int64 = 0
-    private var frameErrorReported = false
-    private var firstFrameReported = false
+    private var anchor = CACurrentMediaTime()
+    private var lastDiagnostic = CACurrentMediaTime()
 
-    private func frameError(_ message: String) {
-        guard !frameErrorReported else { return }
-        frameErrorReported = true
-        error = message
-        record(message)
+    private func record(_ message: String) {
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let lines = diagnosticLog.split(separator: "\n").map(String.init) + ["\(stamp) · \(message)"]
+        diagnosticLog = lines.suffix(80).joined(separator: "\n")
     }
 
-    override init() {
-        super.init()
-        displayLayer.videoGravity = .resizeAspect
-        displayLayer.backgroundColor = UIColor.black.cgColor
-        var timebase: CMTimebase?
-        CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &timebase)
-        if let timebase {
-            CMTimebaseSetTime(timebase, time: .zero)
-            CMTimebaseSetRate(timebase, rate: 1)
-            displayLayer.controlTimebase = timebase
+    func attach(_ view: PromptView) {
+        guard inlineView !== view else { return }
+        inlineView = view
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            error = "Картинка в картинке недоступна."; return
         }
-        if AVPictureInPictureController.isPictureInPictureSupported() {
-            let source = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: displayLayer, playbackDelegate: self)
-            let controller = AVPictureInPictureController(contentSource: source)
-            controller.delegate = self
-            controller.requiresLinearPlayback = true
-            controller.canStartPictureInPictureAutomaticallyFromInline = true
-            pip = controller
-            observation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] _, value in
+        let controller = AVPictureInPictureVideoCallViewController()
+        controller.preferredContentSize = CGSize(width: 640, height: 360)
+        controller.view.backgroundColor = .black
+        overlayView.translatesAutoresizingMaskIntoConstraints = false
+        controller.view.addSubview(overlayView)
+        NSLayoutConstraint.activate([
+            overlayView.leadingAnchor.constraint(equalTo: controller.view.leadingAnchor),
+            overlayView.trailingAnchor.constraint(equalTo: controller.view.trailingAnchor),
+            overlayView.topAnchor.constraint(equalTo: controller.view.topAnchor),
+            overlayView.bottomAnchor.constraint(equalTo: controller.view.bottomAnchor)
+        ])
+        contentController = controller
+        let source = AVPictureInPictureController.ContentSource(activeVideoCallSourceView: view, contentViewController: controller)
+        let pip = AVPictureInPictureController(contentSource: source)
+        pip.delegate = self
+        pip.canStartPictureInPictureAutomaticallyFromInline = true
+        self.pip = pip
+        observations = [
+            pip.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] _, value in
                 DispatchQueue.main.async { self?.ready = value.newValue ?? false }
+            },
+            pip.observe(\.isPictureInPictureSuspended, options: [.new]) { [weak self] _, value in
+                DispatchQueue.main.async { self?.record("Hosted PiP suspended=\(value.newValue ?? false)") }
             }
-                    stateObservations = [
-                controller.observe(\.isPictureInPictureSuspended, options: [.initial, .new]) { [weak self] _, value in
-                    DispatchQueue.main.async { self?.record("PiP suspended=\(value.newValue ?? false)") }
-                },
-                controller.observe(\.isPictureInPictureActive, options: [.initial, .new]) { [weak self] _, value in
-                    DispatchQueue.main.async { self?.record("PiP active=\(value.newValue ?? false)") }
-                }
-            ]
-        } else { error = "Картинка в картинке недоступна." }
-        interruptionObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
-            let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            Task { @MainActor in
-                // Record the event without reactivating audio or fighting the recording app.
-                if type == AVAudioSession.InterruptionType.began.rawValue {
-                    self?.status = "Аудиосессия прервана другим приложением"
-                    self?.record("Audio interruption began")
-                } else {
-                    self?.status = "Прерывание аудиосессии завершено"
-                    self?.record("Audio interruption ended")
-                }
-            }
-        }
+        ]
+        render()
     }
 
     func configure(text: String, speed: Double, fontSize: Double) {
-        record("Apply pressed: \(text.count) characters")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { error = "Вставьте текст."; return }
         guard text.count <= 20000 else { error = "Максимум 20 000 символов."; return }
         prompt = text; self.speed = speed; self.fontSize = fontSize
-        error = nil; configured = true
-        frameErrorReported = false; firstFrameReported = false
-        displayLayer.flushAndRemoveImage()
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
-        } catch { self.error = error.localizedDescription; record("Audio category: \(error.localizedDescription)") }
-        textHeight = Double((text as NSString).boundingRect(with: CGSize(width: 592, height: CGFloat.greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes, context: nil).height)
+        textHeight = Double((text as NSString).boundingRect(with: CGSize(width: 592, height: CGFloat.greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: UIFont.systemFont(ofSize: fontSize, weight: .medium)], context: nil).height)
+        configured = true; error = nil
         reset()
-        status = "Прямые кадры готовы · версия 0.5"
-        startTimer()
-    }
-
-    private var attributes: [NSAttributedString.Key: Any] {
-        [.font: UIFont.systemFont(ofSize: fontSize, weight: .medium), .foregroundColor: UIColor.white]
-    }
-
-    func setPlaying(_ value: Bool) {
-        if value && elapsed >= duration { elapsed = 0 }
-        playing = value
-        lastTick = CACurrentMediaTime()
-        pip?.invalidatePlaybackState()
-    }
-
-    func reset() {
-        elapsed = 0
-        setPlaying(false)
-        drawFrame()
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        status = "Текст применён · версия 0.6"
+        record("Hosted text applied: \(text.count) characters; no audio session")
     }
 
     private var duration: Double { (textHeight + 280) / speed + 3 }
-
+    private func advance() {
+        let now = CACurrentMediaTime()
+        if playing { elapsed = min(duration, elapsed + max(0, now - anchor)) }
+        anchor = now
+        if elapsed >= duration { playing = false }
+    }
+    func setPlaying(_ value: Bool) {
+        advance()
+        if value && elapsed >= duration { elapsed = 0 }
+        playing = value; anchor = CACurrentMediaTime()
+        render()
+    }
+    func reset() { playing = false; elapsed = 0; anchor = CACurrentMediaTime(); render() }
     func openPiP() {
+        guard configured else { return }
         guard let pip, pip.isPictureInPicturePossible else { error = "PiP пока не готово. Подождите секунду и повторите."; return }
-        do {
-            // PiP requires a playback category; no audio player or microphone is used.
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            if activateAudioSession {
-                try AVAudioSession.sharedInstance().setActive(true)
-                record("Start PiP: playback session activated")
-            } else {
-                try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-                record("Start PiP: playback session NOT activated")
-            }
-        } catch { self.error = error.localizedDescription; return }
+        error = nil
         setPlaying(true)
+        record("Starting hosted-view PiP (video-call content source)")
         pip.startPictureInPicture()
     }
-
-    private func startTimer() {
-        timer?.invalidate()
-        lastTick = CACurrentMediaTime()
-        let timer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
-    }
-
     private func tick() {
-        let now = CACurrentMediaTime()
-        let delta = now - lastTick
-        if delta > 1 { record("Rendering gap: \(Int(delta)) seconds") }
-        lastTick = now
-        if playing {
-            // Avoid skipping paragraphs if the OS suspends rendering.
-            elapsed += min(delta, 0.25)
-            if elapsed >= duration { elapsed = duration; setPlaying(false) }
-        }
-        drawFrame()
-    }
-
-    private func drawFrame() {
-        guard configured else { return }
-        autoreleasepool {
-            if pool == nil {
-                let settings: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey as String: 640,
-                    kCVPixelBufferHeightKey as String: 360,
-                    kCVPixelBufferCGImageCompatibilityKey as String: true,
-                    kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-                    kCVPixelBufferMetalCompatibilityKey as String: true
-                ]
-                let result = CVPixelBufferPoolCreate(nil, nil, settings as CFDictionary, &pool)
-                if result != kCVReturnSuccess { frameError("Не удалось создать буфер кадров: \(result)") }
-            }
-            var optionalBuffer: CVPixelBuffer?
-            guard let pool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer) == kCVReturnSuccess, let buffer = optionalBuffer else { frameError("Не удалось выделить кадр."); return }
-            guard CVPixelBufferGetIOSurface(buffer) != nil else {
-                frameError("Кадр не поддерживает аппаратное отображение."); return
-            }
-            CVPixelBufferLockBaseAddress(buffer, [])
-            guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 640, height: 360, bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue) else {
-                CVPixelBufferUnlockBaseAddress(buffer, []); frameError("Не удалось создать графический контекст."); return
-            }
-            context.setFillColor(UIColor.black.cgColor)
-            context.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
-            context.translateBy(x: 0, y: 360); context.scaleBy(x: 1, y: -1)
-            UIGraphicsPushContext(context)
-            (prompt as NSString).draw(with: CGRect(x: 24, y: 80 - max(0, elapsed - 3) * speed, width: 592, height: textHeight + 4),
-                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes, context: nil)
-            UIGraphicsPopContext()
-            CVPixelBufferUnlockBaseAddress(buffer, [])
-            if format == nil { CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &format) }
-            guard let format else { frameError("Не удалось создать формат кадра."); return }
-            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 20),
-                presentationTimeStamp: displayLayer.controlTimebase.map { CMTimebaseGetTime($0) } ?? CMClockGetTime(CMClockGetHostTimeClock()), decodeTimeStamp: .invalid)
-            frameNumber += 1
-            var sample: CMSampleBuffer?
-            let result = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer,
-                formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
-            guard result == noErr, let sample else { frameError("Не удалось создать видеокадр: \(result)"); return }
-            // Immediate presentation avoids relying on a media player's playback clock.
-            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
-               CFArrayGetCount(attachments) > 0 {
-                let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-                CFDictionarySetValue(dictionary,
-                    Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-            }
-            if displayLayer.status == .failed {
-                let message = displayLayer.error?.localizedDescription ?? "Ошибка слоя отображения"
-                frameError(message)
-                displayLayer.flush()
-            }
-            if displayLayer.isReadyForMoreMediaData {
-                displayLayer.enqueue(sample)
-                if !firstFrameReported {
-                    firstFrameReported = true
-                    record("First frame enqueued, layer status=\(displayLayer.status.rawValue)")
-                }
-            }
+        advance(); render()
+        if pip?.isPictureInPictureActive == true && CACurrentMediaTime() - lastDiagnostic >= 10 {
+            lastDiagnostic = CACurrentMediaTime()
+            record("Hosted PiP tick: \(Int(elapsed))s, scrolling=\(playing)")
         }
     }
-
-    func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) { record("PiP requested playing=\(playing)"); setPlaying(playing) }
-    func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+    private func render() {
+        let y = 80 - max(0, elapsed - 3) * speed
+        inlineView?.present(text: prompt, fontSize: fontSize, y: y, height: textHeight)
+        overlayView.present(text: prompt, fontSize: fontSize, y: y, height: textHeight)
     }
-    func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool { !playing }
-    func pictureInPictureController(_ controller: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
-    func pictureInPictureController(_ controller: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-        elapsed = min(duration, max(0, elapsed + skipInterval.seconds))
-        drawFrame(); completionHandler()
+    func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) { render() }
+    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        status = "Текстовое PiP запущено · версия 0.6"; record("Hosted PiP did start"); render()
     }
-    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ controller: AVPictureInPictureController) -> Bool { true }
-    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) { status = "PiP запущено · прямые кадры"; record("PiP did start") }
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
-        record("PiP did stop"); setPlaying(false); status = "PiP остановлено системой или пользователем"
+        setPlaying(false); status = "Плавающее окно закрыто"; record("Hosted PiP did stop")
     }
-    func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) { self.error = error.localizedDescription }
+    func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        setPlaying(false); self.error = error.localizedDescription; record("Hosted PiP failed: \(error.localizedDescription)")
+    }
     func pictureInPictureController(_ controller: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) { completionHandler(true) }
-
-    deinit {
-        timer?.invalidate()
-        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
-    }
+    deinit { timer?.invalidate() }
 }
 
 struct ContentView: View {
@@ -275,7 +148,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Text("Версия 0.5 · диагностика кадров").font(.caption).foregroundStyle(.secondary)
+                    Text("Версия 0.6 · текстовое плавающее окно").font(.caption).foregroundStyle(.secondary)
                     if let error = model.error { Text(error).foregroundStyle(.red) }
                     TextEditor(text: $text).focused($editingText)
                         .frame(height: 220).padding(8)
@@ -304,16 +177,12 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent)
                         Text(model.ready ? "PiP готово" : "PiP пока недоступно").font(.caption)
                     }
-                    Toggle("Активировать аудиосессию (режим сравнения)", isOn: $model.activateAudioSession)
-                        .font(.footnote)
-                    Text("Диагностическая версия 0.5. Сначала проверьте с выключенным переключателем. Для смены режима закройте PiP.")
-                        .font(.footnote).foregroundStyle(.secondary)
                     Text(model.status).font(.footnote).foregroundStyle(.secondary)
                     DisclosureGroup("Журнал диагностики") {
                         Text(model.diagnosticLog).font(.caption.monospaced()).textSelection(.enabled)
                         Button("Скопировать журнал") { UIPasteboard.general.string = model.diagnosticLog }
                     }
-                    Text("Без подготовки видео. Проверяем работу прямых кадров во время записи. Если текст или настройки изменены, нажмите «Применить».")
+                    Text("Окно содержит текст без видеоплеера. Скорость задаётся заранее. Для паузы вернитесь в приложение. После изменения текста нажмите «Применить».")
                         .font(.footnote).foregroundStyle(.secondary)
                         .onTapGesture { editingText = false }
                     if let error = model.error { Text(error).foregroundStyle(.red) }
@@ -332,28 +201,39 @@ struct ContentView: View {
 }
 
 final class PromptView: UIView {
-    var promptLayer: AVSampleBufferDisplayLayer?
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        promptLayer?.frame = bounds
-        CATransaction.commit()
+    private var text = ""
+    private var fontSize = 32.0
+    private var y = 80.0
+    private var textHeight = 0.0
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black; isOpaque = true; clipsToBounds = true
+        contentMode = .redraw
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    func present(text: String, fontSize: Double, y: Double, height: Double) {
+        self.text = text; self.fontSize = fontSize; self.y = y; textHeight = height
+        setNeedsDisplay()
+    }
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext(), bounds.width > 0, bounds.height > 0 else { return }
+        let scale = min(bounds.width / 640, bounds.height / 360)
+        context.saveGState()
+        context.translateBy(x: (bounds.width - 640 * scale) / 2, y: (bounds.height - 360 * scale) / 2)
+        context.scaleBy(x: scale, y: scale)
+        (text as NSString).draw(with: CGRect(x: 24, y: y, width: 592, height: textHeight + 4), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: UIFont.systemFont(ofSize: fontSize, weight: .medium), .foregroundColor: UIColor.white], context: nil)
+        context.restoreGState()
     }
 }
-
 struct PromptSurface: UIViewRepresentable {
     let model: PromptModel
     func makeUIView(context: Context) -> PromptView {
-        let view = PromptView()
-        view.backgroundColor = .black
-        view.promptLayer = model.displayLayer
-        view.layer.addSublayer(model.displayLayer)
+        let view = PromptView(frame: .zero)
+        model.attach(view)
         return view
     }
     func updateUIView(_ view: PromptView, context: Context) {}
 }
-
-
 struct PreviewSmokeView: View {
     @StateObject private var model = PromptModel()
     var body: some View {
